@@ -13,9 +13,45 @@ import type { Job } from "../jobs";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
+const LOGS_DIR = join(HEARTBEAT_DIR, "logs");
 const STATUSLINE_FILE = join(CLAUDE_DIR, "statusline.cjs");
 const CLAUDE_SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 const PREFLIGHT_SCRIPT = fileURLToPath(new URL("../preflight.ts", import.meta.url));
+
+async function runScript(
+  label: string,
+  command: string
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const startTime = Date.now();
+  const proc = Bun.spawn(["sh", "-c", command], {
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: process.cwd(),
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const exitCode = await proc.exited;
+  const duration = Date.now() - startTime;
+
+  // Write log file matching the existing log convention
+  const logName = `${label}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+  const logContent = [
+    `Date: ${new Date().toISOString()}`,
+    `Type: script`,
+    `Command: ${command}`,
+    `Duration: ${duration}ms`,
+    `Exit code: ${exitCode}`,
+    `Output: ${stdout.trim() || "(empty)"}`,
+    ...(stderr.trim() ? [`Stderr: ${stderr.trim()}`] : []),
+  ].join("\n");
+  await Bun.write(join(LOGS_DIR, logName), logContent).catch(() => {});
+
+  console.log(`[${new Date().toLocaleTimeString()}] [script] ${label}: exit ${exitCode} (${duration}ms) — ${stdout.trim().split("\n")[0] || "(empty)"}`);
+
+  return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+}
 
 // --- Statusline setup/teardown ---
 
@@ -340,7 +376,7 @@ export async function start(args: string[] = []) {
   console.log(`  Web UI: ${webEnabled ? `http://${settings.web.host}:${webPort}` : "disabled"}`);
   if (debugFlag) console.log("  Debug: enabled");
   console.log(`  Jobs loaded: ${jobs.length}`);
-  jobs.forEach((j) => console.log(`    - ${j.name} [${j.schedule}]`));
+  jobs.forEach((j) => console.log(`    - ${j.name} [${j.schedule}]${j.type === "script" ? " (script)" : ""}`));
 
   // --- Mutable state ---
   let currentSettings: Settings = settings;
@@ -696,8 +732,11 @@ export async function start(args: string[] = []) {
     const now = new Date();
     for (const job of currentJobs) {
       if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
-        resolvePrompt(job.prompt)
-          .then((prompt) => run(job.name, prompt))
+        const execution = job.type === "script"
+          ? runScript(job.name, job.prompt)
+          : resolvePrompt(job.prompt).then((prompt) => run(job.name, prompt));
+
+        execution
           .then((r) => {
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;

@@ -3,12 +3,15 @@ import { join } from "path";
 
 const JOBS_DIR = join(process.cwd(), ".claude", "claudeclaw", "jobs");
 
+export type JobType = "prompt" | "script";
+
 export interface Job {
   name: string;
   schedule: string;
   prompt: string;
   recurring: boolean;
   notify: true | false | "error";
+  type: JobType;
 }
 
 function parseFrontmatterValue(raw: string): string {
@@ -51,7 +54,13 @@ function parseJobFile(name: string, content: string): Job | null {
     : notifyRaw === "error" ? "error"
     : true;
 
-  return { name, schedule, prompt, recurring, notify };
+  const typeLine = lines.find((l) => l.startsWith("type:"));
+  const typeRaw = typeLine
+    ? parseFrontmatterValue(typeLine.replace("type:", "")).toLowerCase()
+    : "";
+  const type: JobType = typeRaw === "script" ? "script" : "prompt";
+
+  return { name, schedule, prompt, recurring, notify, type };
 }
 
 export async function loadJobs(): Promise<Job[]> {

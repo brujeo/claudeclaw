@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
 import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
@@ -51,10 +51,20 @@ function emitCompactEvent(event: CompactEvent): void {
   }
 }
 
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  costUsd: number;
+  durationMs: number;
+}
+
 export interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  usage?: TokenUsage;
 }
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
@@ -384,10 +394,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
   );
 
-  // New session: use json output to capture Claude's session_id
-  // Resumed session: use text output with --resume
-  const outputFormat = isNew ? "json" : "text";
-  const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
+  // Always use JSON output to capture session_id and token usage stats
+  const args = ["claude", "-p", prompt, "--output-format", "json", ...securityArgs];
 
   if (!isNew) {
     args.push("--resume", existing.sessionId);
@@ -444,22 +452,42 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     stdout = rateLimitMessage;
   }
 
-  // For new sessions, parse the JSON to extract session_id and result text
-  if (!rateLimitMessage && isNew && exitCode === 0) {
+  // Parse JSON output to extract session_id, result text, and token usage
+  let usage: TokenUsage | undefined;
+  if (!rateLimitMessage && exitCode === 0) {
     try {
       const json = JSON.parse(rawStdout);
-      sessionId = json.session_id;
       stdout = json.result ?? "";
-      // Save the real session ID from Claude Code
-      if (threadId) {
-        await createThreadSession(threadId, sessionId);
-        console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
-      } else {
-        await createSession(sessionId);
-        console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
+
+      // Extract token usage stats
+      if (json.usage) {
+        usage = {
+          inputTokens: json.usage.input_tokens ?? 0,
+          outputTokens: json.usage.output_tokens ?? 0,
+          cacheCreationInputTokens: json.usage.cache_creation_input_tokens ?? 0,
+          cacheReadInputTokens: json.usage.cache_read_input_tokens ?? 0,
+          costUsd: json.cost_usd ?? 0,
+          durationMs: json.duration_ms ?? 0,
+        };
+      }
+
+      // Save the real session ID from Claude Code (new sessions only)
+      if (isNew && json.session_id) {
+        sessionId = json.session_id;
+        if (threadId) {
+          await createThreadSession(threadId, sessionId);
+          console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
+        } else {
+          await createSession(sessionId);
+          console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
+        }
+      } else if (json.session_id) {
+        sessionId = json.session_id;
       }
     } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
+      console.error(`[${new Date().toLocaleTimeString()}] Failed to parse JSON output from Claude:`, e);
+      // Fallback: treat raw output as text
+      stdout = rawStdout;
     }
   }
 
@@ -467,7 +495,21 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     stdout,
     stderr,
     exitCode,
+    usage,
   };
+
+  const usageLines = usage
+    ? [
+        "",
+        "## Token Usage",
+        `Input tokens: ${usage.inputTokens.toLocaleString()}`,
+        `Output tokens: ${usage.outputTokens.toLocaleString()}`,
+        `Cache creation: ${usage.cacheCreationInputTokens.toLocaleString()}`,
+        `Cache read: ${usage.cacheReadInputTokens.toLocaleString()}`,
+        `Cost: $${usage.costUsd.toFixed(4)}`,
+        `Duration: ${(usage.durationMs / 1000).toFixed(1)}s`,
+      ]
+    : [];
 
   const output = [
     `# ${name}`,
@@ -477,6 +519,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     ...(agentic.enabled ? [`Task type: ${taskType}`, `Routing: ${routingReasoning}`] : []),
     `Prompt: ${prompt}`,
     `Exit code: ${result.exitCode}`,
+    ...usageLines,
     "",
     "## Output",
     stdout,
@@ -484,7 +527,34 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   ].join("\n");
 
   await Bun.write(logFile, output);
-  console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
+
+  // Append to usage log (JSONL format for easy aggregation)
+  if (usage) {
+    const usageEntry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      job: name,
+      session: sessionId,
+      model: usedFallback ? (fallbackConfig.model || "fallback") : (primaryConfig.model || "default"),
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      costUsd: usage.costUsd,
+      durationMs: usage.durationMs,
+    });
+    const usageLogFile = join(LOGS_DIR, "usage.jsonl");
+    try {
+      await appendFile(usageLogFile, usageEntry + "\n");
+    } catch {
+      await Bun.write(usageLogFile, usageEntry + "\n");
+    }
+  }
+
+  console.log(
+    `[${new Date().toLocaleTimeString()}] Done: ${name}` +
+    (usage ? ` (${usage.inputTokens + usage.outputTokens} tokens, $${usage.costUsd.toFixed(4)})` : "") +
+    ` → ${logFile}`
+  );
 
   // --- Auto-compact on timeout (exit 124) ---
   if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing) {
@@ -502,10 +572,31 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
       const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      let retryStdout = retryExec.rawStdout;
+      let retryUsage: TokenUsage | undefined;
+      if (retryExec.exitCode === 0) {
+        try {
+          const retryJson = JSON.parse(retryExec.rawStdout);
+          retryStdout = retryJson.result ?? "";
+          if (retryJson.usage) {
+            retryUsage = {
+              inputTokens: retryJson.usage.input_tokens ?? 0,
+              outputTokens: retryJson.usage.output_tokens ?? 0,
+              cacheCreationInputTokens: retryJson.usage.cache_creation_input_tokens ?? 0,
+              cacheReadInputTokens: retryJson.usage.cache_read_input_tokens ?? 0,
+              costUsd: retryJson.cost_usd ?? 0,
+              durationMs: retryJson.duration_ms ?? 0,
+            };
+          }
+        } catch {
+          retryStdout = retryExec.rawStdout;
+        }
+      }
       const retryResult: RunResult = {
-        stdout: retryExec.rawStdout,
+        stdout: retryStdout,
         stderr: retryExec.stderr,
         exitCode: retryExec.exitCode,
+        usage: retryUsage,
       };
       emitCompactEvent({
         type: "auto-compact-retry",
